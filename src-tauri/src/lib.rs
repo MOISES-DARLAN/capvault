@@ -54,7 +54,36 @@ fn is_capcut_project(path: &Path) -> bool {
     path.join("draft_content.json").is_file() || path.join("draft_meta_info.json").is_file()
 }
 
+fn registry_entry_matches(project: &serde_json::Value, path: &Path) -> bool {
+    project
+        .get("draft_fold_path")
+        .and_then(|value| value.as_str())
+        .and_then(|folder| Path::new(folder).file_name())
+        == path.file_name()
+}
+
+fn registered_project_name(path: &Path) -> Option<String> {
+    let registry_path = path.parent()?.join("root_meta_info.json");
+    let contents = fs::read_to_string(registry_path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+
+    value
+        .get("all_draft_store")?
+        .as_array()?
+        .iter()
+        .find(|project| registry_entry_matches(project, path))
+        .and_then(|project| project.get("draft_name"))
+        .and_then(|name| name.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 fn project_display_name(path: &Path) -> String {
+    if let Some(name) = registered_project_name(path) {
+        return name;
+    }
+
     let metadata_path = path.join("draft_meta_info.json");
     if let Ok(contents) = fs::read_to_string(metadata_path) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) {
@@ -151,6 +180,74 @@ fn list_projects(root: String) -> Result<Vec<ProjectInfo>, String> {
     }
     projects.sort_by_key(|project| std::cmp::Reverse(project.modified_at));
     Ok(projects)
+}
+
+#[tauri::command]
+fn rename_project(root: String, project: String, name: String) -> Result<String, String> {
+    let project = canonical_project(Path::new(&root), Path::new(&project))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Informe um nome para o projeto".into());
+    }
+    if name.chars().count() > 120 {
+        return Err("O nome do projeto deve ter no máximo 120 caracteres".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("O nome do projeto contém caracteres inválidos".into());
+    }
+
+    let mut changes = Vec::<(PathBuf, Vec<u8>, Vec<u8>)>::new();
+    let registry_path = project
+        .parent()
+        .expect("a pasta do projeto validado deve ter uma pasta raiz")
+        .join("root_meta_info.json");
+    if registry_path.is_file() {
+        let original = fs::read(&registry_path)
+            .map_err(|error| error_message("Falha ao ler o registro do CapCut", error))?;
+        let mut registry: serde_json::Value = serde_json::from_slice(&original)
+            .map_err(|error| error_message("O registro do CapCut é inválido", error))?;
+        if let Some(entry) = registry
+            .get_mut("all_draft_store")
+            .and_then(|entries| entries.as_array_mut())
+            .and_then(|entries| {
+                entries
+                    .iter_mut()
+                    .find(|entry| registry_entry_matches(entry, &project))
+            })
+        {
+            entry["draft_name"] = serde_json::Value::String(name.to_string());
+            let updated = serde_json::to_vec(&registry)
+                .map_err(|error| error_message("Falha ao atualizar o registro do CapCut", error))?;
+            changes.push((registry_path, original, updated));
+        }
+    }
+
+    let metadata_path = project.join("draft_meta_info.json");
+    if metadata_path.is_file() {
+        let original = fs::read(&metadata_path)
+            .map_err(|error| error_message("Falha ao ler os metadados do projeto", error))?;
+        let mut metadata: serde_json::Value = serde_json::from_slice(&original)
+            .map_err(|error| error_message("Os metadados do projeto são inválidos", error))?;
+        metadata["draft_name"] = serde_json::Value::String(name.to_string());
+        let updated = serde_json::to_vec(&metadata)
+            .map_err(|error| error_message("Falha ao atualizar os metadados do projeto", error))?;
+        changes.push((metadata_path, original, updated));
+    }
+
+    if changes.is_empty() {
+        return Err("Não foi encontrado um metadado compatível para renomear o projeto".into());
+    }
+
+    for index in 0..changes.len() {
+        if let Err(error) = fs::write(&changes[index].0, &changes[index].2) {
+            for (path, original, _) in changes[..index].iter().rev() {
+                let _ = fs::write(path, original);
+            }
+            return Err(error_message("Não foi possível salvar o novo nome", error));
+        }
+    }
+
+    Ok(name.to_string())
 }
 
 #[tauri::command]
@@ -387,6 +484,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             detect_default_root,
             list_projects,
+            rename_project,
             export_project,
             import_project
         ])
@@ -437,6 +535,62 @@ mod tests {
     fn unsafe_names_are_sanitized() {
         assert_eq!(safe_project_name(" ../Projeto:*? "), "_Projeto___");
         assert_eq!(safe_project_name("..."), "Projeto importado");
+    }
+
+    #[test]
+    fn current_registry_name_takes_priority_over_stale_project_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("draft-123");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            project.join("draft_meta_info.json"),
+            r#"{"draft_name":"Nome antigo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("root_meta_info.json"),
+            format!(
+                r#"{{"all_draft_store":[{{"draft_fold_path":{},"draft_name":"Nome atual"}}]}}"#,
+                serde_json::to_string(&project.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(project_display_name(&project), "Nome atual");
+    }
+
+    #[test]
+    fn rename_updates_registry_and_project_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("draft-123");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            project.join("draft_meta_info.json"),
+            r#"{"draft_name":"Nome antigo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("root_meta_info.json"),
+            format!(
+                r#"{{"all_draft_store":[{{"draft_fold_path":{},"draft_name":"Nome antigo"}}]}}"#,
+                serde_json::to_string(&project.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let renamed = rename_project(
+            root.path().to_string_lossy().into_owned(),
+            project.to_string_lossy().into_owned(),
+            "  Novo nome  ".into(),
+        )
+        .unwrap();
+
+        assert_eq!(renamed, "Novo nome");
+        assert_eq!(project_display_name(&project), "Novo nome");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(project.join("draft_meta_info.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["draft_name"], "Novo nome");
     }
 
     #[test]
